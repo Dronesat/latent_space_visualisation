@@ -15,6 +15,11 @@ import pandas as pd
 import json
 from bs4 import BeautifulSoup
 
+import plotly.graph_objects as go
+import plotly.express as px
+import dash
+from dash import dcc, html
+
 from cryodrgn_libs import analysis
 from cryodrgn_libs.dataset import ImageDataset
 from affinity.affinity_vega_loader import AffinityVegaLoadHTML
@@ -67,23 +72,39 @@ class LatentSpace(ABC):
         nearest_points = data[nearest_indices]
         return nearest_points, nearest_indices
     
-    # Copy from analysis.py
-    def run_pca(self, z: np.ndarray) -> Tuple[np.ndarray, PCA]:
+    def run_pca_fit(self, z: np.ndarray) -> PCA:
+        """
+        Fit a PCA model to the data z and return the fitted PCA object
+        """
         pca = PCA(z.shape[1])
         pca.fit(z)
-        pc = pca.transform(z)
-        # assign pca to global instead of returning it 
-        return pc, pca
+        return pca
     
-    # Copy from analysis.py
-    def run_umap(z: np.ndarray, **kwargs) -> np.ndarray:
-        import umap  # CAN GET STUCK IN INFINITE IMPORT LOOP
-
+    def run_pca_transform(self, z: np.ndarray, pca: PCA) -> np.ndarray:
+        """
+        Transform the data z using a fitted PCA model
+        """
+        pc = pca.transform(z)
+        return pc
+    
+    def run_umap_fit(self, z: np.ndarray, **kwargs):
+        """
+        Fit a UMAP model to the data z and return the fitted UMAP object
+        """
+        import umap
         reducer = umap.UMAP(**kwargs)
-        z_embedded = reducer.fit_transform(z)
+        reducer.fit(z)
+        return reducer
+    
+    def run_umap_transform(self, z: np.ndarray, reducer):
+        """
+        Transform the data z using a fitted UMAP model 
+        """
+        z_embedded = reducer.transform(z)
         return z_embedded
     
     # Copy from analysis.py
+    # Scilearn tsne doesn't have a separate fit/tranform functions
     def run_tsne(z: np.ndarray, n_components: int = 2, perplexity: float = 1000 ) -> np.ndarray:
         if len(z) > 10000:
             warnings.warn(
@@ -104,7 +125,6 @@ class LatentSpace(ABC):
         labels = kmeans.fit_predict(z)
         centers = kmeans.cluster_centers_
 
-        # Last 3 lines there are better way to do, discuss on Monday 
         # use kmeans_predict instead of get_nearest_point()
         # https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html
         centers_ind = None
@@ -189,6 +209,7 @@ class LatentSpace(ABC):
         if len(df) != len(self.df_latent_space_coords):
             raise ValueError('Dataframe does not have the same number of rows as df_latent_space_coords')
     
+    # Don't see the use of this function bc df_latent already in init and df_embedding depends on df_latent
     def build_df_latent_embs(self):
         """
         Enforce that both df_latent_space_coords and df_embeddings are present 
@@ -201,6 +222,19 @@ class LatentSpace(ABC):
             raise ValueError('df_embeddings does not exist')
         self.check_df_size(self.df_embeddings)
         return self.df_latent_space_coords, self.df_embeddings 
+    
+    def plotly_graph(self, df: pd.DataFrame, title: str, x_axis: str, y_axis: str):
+        figure = go.Figure()
+        figure.add_trace(
+            go.Scatter(x=df[x_axis], y=df[y_axis], mode='lines')
+        )
+        figure.update_layout(
+            title=title,
+            xaxis_title=x_axis,
+            yaxis_title=y_axis,
+            height=400, width=700
+)
+        return figure
 
 class CryoDRGNLatent(LatentSpace):
     def __init__(self, workdir: str, epoch: int, kmeans_cluster_number: int, latent_space_coords_path: str, embedding2d_path: str):
@@ -220,9 +254,6 @@ class CryoDRGNLatent(LatentSpace):
         self.df_kmeans_centers = None
         self.load_build_df_latent_space_coords()
         self.load_kmeans()
-        self.run_analysis() # to seperately 
-        self.load_build_df_embeddings()
-        self.build_df_kmeans_centers()
     
     def parse_training_loss_file(self, file: str) -> np.ndarray:
         """
@@ -243,17 +274,16 @@ class CryoDRGNLatent(LatentSpace):
         self.training_loss = self.parse_training_loss_file(f'{self.workdir}/run.log')
 
         '''PCA of latent space with density profiles'''
-        self.pc, pca = self.run_pca(self.latent_space_coords)
+        pca = self.run_pca_fit(self.latent_space_coords)
+        self.pc = self.run_pca_transform(self.latent_space_coords, pca)
 
         '''K-means centres on PCA of latent space'''
         self.K = self.kmeans_centers.shape[0]
         self.c = pca.transform(self.kmeans_centers) # transform to view with PCs 
     
     def load_build_df_latent_space_coords(self):
-        if self.pc is None:
-            raise ValueError('run_analysis() must be called before load_build_df_latent_space_coords()')
         self.latent_space_coords = self.load_pickle(self.latent_space_coords_path) #numpy.ndarray
-        super().build_df_latent_space_coords()
+        self.build_df_latent_space_coords()
 
     def load_build_df_embeddings(self):
         self.embedding2d = self.load_pickle(self.embedding2d_path) #numpy.ndarray
@@ -273,8 +303,6 @@ class CryoDRGNLatent(LatentSpace):
         self.kmeans_centers = np.loadtxt(kmeans_centers_path)
 
     def build_df_kmeans_centers(self):
-        if self.c is None:
-            raise ValueError(f'run_analysis must be called before {self.build_df_kmeans_centers.__name__}')
         df_kmeans_centers_lat = pd.DataFrame(
             self.kmeans_centers,
             columns=[f'k_lat{i+1}' for i in range(self.kmeans_centers.shape[1])]
@@ -286,9 +314,7 @@ class CryoDRGNLatent(LatentSpace):
             columns=[f'k_pc{i+1}' for i in range(self.c.shape[1])]
         )
         self.df_kmeans_centers = pd.concat([df_kmeans_centers_lat, df_kmeans_pc], axis = 1)
-        print(self.df_kmeans_centers)
 
-    # Will move to specific algorithm (cryodrgn)
     def build_df_labels(self):
         """
         Build a dataframe for clustering labels (Kmeans, GMM, Nearest Neighbor)
@@ -467,44 +493,6 @@ class AffinityLatent(LatentSpace):
         df_affinity = pd.DataFrame(affinity_dataset)
         return df_affinity
 
-def run_cryodrgn():
-    workdir = os.path.expandvars('${HOME}/myproject/cryodrgn_dataset/CryoDRGN/job002/train_128')
-    epoch = 24
-    cryo_job = CryoDRGNLatent(
-        workdir=workdir,
-        epoch=epoch,
-        kmeans_cluster_number=20,
-        latent_space_coords_path=f'{workdir}/z.{epoch}.pkl',
-        embedding2d_path=f'{workdir}/analyze.{epoch}/umap.pkl'
-    )
-    cryo_job.load_latent_space_coords()
-    print("Latent shape:", cryo_job.latent_space_coords.shape)
-    cryo_job.load_embedding2d()
-    print("UMAP shape:", cryo_job.embedding2d.shape)
-    cryo_job.load_kmeans()
-    print("Kmeans labels:", cryo_job.kmeans_labels.shape)
-    cryo_job.load_cryodrgn_config()
-    print("Kmeans centers:", cryo_job.kmeans_centers.shape)
-    #print("Config:", loader.config)
-    print("CryoDRGN config particles file:", cryo_job.config.get('dataset_args', {}).get('particles'))
-    # Get index for on-datakmeans_centers cluster center
-    kmeans_centers, centers_ind = cryo_job.get_nearest_point(
-        cryo_job.latent_space_coords, cryo_job.kmeans_centers
-    )
-    print("On-data cluster centers shape:", kmeans_centers.shape)
-    print("Indices of on-data cluster centers:", centers_ind)
-
-    cryo_job.load_poses()
-    print("Rotation shape:", cryo_job.rotation)
-    print("Translation shape:", cryo_job.translation.shape)
-    print("Euler angles shape:", cryo_job.euler_angles.shape)
-
-    cryo_job.summary()
-
-    loss, pc, pca, K, c = cryo_job.run_analysis()
-
-    print('Done')
-
 def run_affinity():
     workdir = os.path.expandvars('${HOME}/myproject/cryodrgn_dataset/CryoDRGN/job002/python_code/affinity')
     affinity_job = AffinityLatent(
@@ -541,7 +529,7 @@ def run_affinity():
     #print(dataframe)
     #dataframe.to_csv("affinity-dataset.csv",encoding='utf-8',index=False)
 
-def cryodrgn_dataframe():
+def run_cryodrgn():
     workdir = os.path.expandvars('${HOME}/myproject/cryodrgn_dataset/CryoDRGN/job002/train_128')
     epoch = 24
     cryo_job = CryoDRGNLatent(
@@ -551,18 +539,33 @@ def cryodrgn_dataframe():
         latent_space_coords_path=f'{workdir}/z.{epoch}.pkl',
         embedding2d_path=f'{workdir}/analyze.{epoch}/umap.pkl'
     )
-    #df_latent, df_emb = cryo_job.build_dataframe()
-    #cryo_job.build_dataframe().to_csv("cryodrgn-dataframe.csv",encoding='utf-8',index=False)
-    #print(cryo_job.build_dataframe())
-    #print(cryo_job.latent_space_coords)
-    #print(cryo_job.df_latent_space_coords)
-    #print(cryo_job.embedding2d)
-    print(cryo_job.df_embeddings)
-    #print(cryo_job.training_loss)
-    #print(cryo_job.pc)
-    #print(cryo_job.K)
-    #print(df_latent)
-    #print(df_emb)
+    cryo_job.run_analysis() 
+    cryo_job.load_build_df_embeddings()
+    cryo_job.build_df_kmeans_centers()
+    cryo_job.build_df_labels()
+
+    os.makedirs("./cryodrgn_output", exist_ok=True)
+    cryo_job.df_latent_space_coords.to_csv("./cryodrgn_output/df_latent.csv",encoding='utf-8',index=False)
+    cryo_job.df_embeddings.to_csv("./cryodrgn_output/df_embeddings.csv",encoding='utf-8',index=False)
+    cryo_job.df_labels.to_csv("./cryodrgn_output/df_labels.csv",encoding='utf-8',index=False)
+    cryo_job.df_kmeans_centers.to_csv("./cryodrgn_output/df_kmeans_centers.csv",encoding='utf-8',index=False)
+
+    x_axis = 'Epoch'
+    y_axis = 'Loss'
+    title = 'Training Loss'
+    df_training_loss = pd.DataFrame({
+        x_axis: list(range(len(cryo_job.training_loss))), 
+        y_axis: cryo_job.training_loss                      
+    })
+
+    fig = cryo_job.plotly_graph(df_training_loss, title, x_axis, y_axis)
+
+    app = dash.Dash(__name__)
+    app.layout = html.Div([
+        html.H1("CryoDRGN Training Loss", style={'textAlign':'center'}),
+        dcc.Graph(figure=fig)
+    ])
+    app.run(debug=True)
 
 def affinity_dataframe():
     workdir = os.path.expandvars('${HOME}/myproject/cryodrgn_dataset/CryoDRGN/job002/python_code/affinity')
@@ -574,10 +577,10 @@ def affinity_dataframe():
     affinity_job.build_dataframe().to_csv("affinity-dataframe.csv",encoding='utf-8',index=False)
     print(affinity_job.build_dataframe())
 
+
 if __name__ == "__main__":
-    #run_cryodrgn()
+    run_cryodrgn()
     #run_affinity()
-    cryodrgn_dataframe()
     #affinity_dataframe()
     
     
